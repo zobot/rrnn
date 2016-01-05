@@ -12,6 +12,7 @@ import argparse
 from time import time
 from StringIO import StringIO
 from param_collection import ParamCollection
+from IPython import embed
 
 # via https://github.com/karpathy/char-rnn/blob/master/model/GRU.lua
 # via http://arxiv.org/pdf/1412.3555v1.pdf
@@ -71,32 +72,60 @@ def make_deep_lstm(size_input, size_mem, n_layers, size_output, size_batch):
 
     return nn.Module(inputs, outputs)
 
-def make_deep_rrnn(size_input, size_mem, n_layers, size_output, size_batch, k_in):
+def make_deep_rrnn(size_input, size_mem, n_layers, size_output, size_batch_in, k_in, k_h):
     inputs = [cgt.matrix() for i_layer in xrange(n_layers+1)]
     outputs = []
+    print 'input_size: ', size_input
     for i_layer in xrange(n_layers):
         prev_h = inputs[i_layer+1] # note that inputs[0] is the external input, so we add 1
         x = inputs[0] if i_layer==0 else outputs[i_layer-1]
         size_x = size_input if i_layer==0 else size_mem
-        input_r_vec = nn.Affine(size_x, size_mem * 2 * k_in, name="i2r")(x)
-        input_r_norm = cgt.norm(input_r, axis=1, keepdims=True)
-        input_rotator = cgt.broadcast('/', input_r_vec, input_r_vec_norm, "xx,x1")
+        size_batch = prev_h.shape[0]
 
-        update_gate = cgt.sigmoid(
-            nn.Affine(size_x, size_mem,name="i2u")(x)
-            + nn.Affine(size_mem, size_mem, name="h2u")(prev_h))
-        reset_gate = cgt.sigmoid(
-            nn.Affine(size_x, size_mem,name="i2r")(x)
-            + nn.Affine(size_mem, size_mem, name="h2r")(prev_h))
-        gated_hidden = reset_gate * prev_h
-        p2 = nn.Affine(size_mem, size_mem)(gated_hidden)
-        p1 = nn.Affine(size_x, size_mem)(x)
-        hidden_target = cgt.tanh(p1+p2)
-        next_h = (1.0-update_gate)*prev_h + update_gate*hidden_target
+        xform_h_param = nn.TensorParam((2 * k_h, size_mem), name="rotxform")
+        xform_h_non = xform_h_param.weight
+        xform_h_norm = cgt.norm(xform_h_non, axis=1, keepdims=True)
+        xform_h = cgt.broadcast('/', xform_h_non, xform_h_norm, "xx,x1")
+
+        r_vec = nn.Affine(size_x, 2 * k_in * size_mem)(x)
+        r_non = cgt.reshape(r_vec, (size_batch, 2 * k_in, size_mem))
+        r_norm = cgt.norm(r_non, axis=2, keepdims=True)
+        r = cgt.broadcast('/', r_non, r_norm, "xxx,xx1")
+        prev_h_3 = cgt.reshape(prev_h, (size_batch, size_mem, 1))
+        inters_in = [prev_h_3]
+
+        colon = slice(None, None, None)
+
+        for i in xrange(2 * k_in):
+            inter_in = inters_in[-1]
+            r_cur = cgt.subtensor(r, [colon, i, colon])
+            r_cur_3_transpose = cgt.reshape(r_cur, (size_batch, 1, size_mem))
+            r_cur_3 = cgt.reshape(r_cur, (size_batch, size_mem, 1))
+            ref_cur = cgt.batched_matmul(r_cur_3, cgt.batched_matmul(r_cur_3_transpose, inter_in))
+            inter_out = inter_in - 2 * ref_cur
+            inters_in.append(inter_out)
+
+        h_in_rot = cgt.reshape(inters_in[-1], (size_batch, size_mem))
+        inters_h = [h_in_rot]
+
+        for i in xrange(2 * k_h):
+            inter_in = inters_h[-1]
+            r_cur = cgt.subtensor(xform_h, [i, colon])
+            r_cur_2_transpose = cgt.reshape(r_cur, (size_mem, 1))
+            r_cur_2 = cgt.reshape(r_cur, (1, size_mem))
+            ref_cur = cgt.dot(cgt.dot(inter_in, r_cur_2_transpose), r_cur_2)
+            inter_out = inter_in - 2 * ref_cur
+            inters_h.append(inter_out)
+        next_h = inters_h[-1]
         outputs.append(next_h)
+
+
     category_activations = nn.Affine(size_mem, size_output,name="pred")(outputs[-1])
     logprobs = nn.logsoftmax(category_activations)
     outputs.append(logprobs)
+
+    #print 'len outputs:', len(outputs)
+    #print 'len inputs:', len(inputs)
 
     return nn.Module(inputs, outputs)
 
@@ -134,14 +163,14 @@ def rmsprop_update(grad, state):
     np.multiply(state.scratch, state.step_size, out=state.scratch)
     state.theta[:] -= state.scratch
 
-def make_loss_and_grad_and_step(arch, size_input, size_output, size_mem, size_batch, n_layers, n_unroll):
+def make_loss_and_grad_and_step(arch, size_input, size_output, size_mem, size_batch, n_layers, n_unroll, k_in, k_h):
     # symbolic variables
 
     x_tnk = cgt.tensor3()
     targ_tnk = cgt.tensor3()
     #make_network = make_deep_lstm if arch=="lstm" else make_deep_gru
     make_network = make_deep_rrnn
-    network = make_network(size_input, size_mem, n_layers, size_output, size_batch)
+    network = make_network(size_input, size_mem, n_layers, size_output, size_batch, k_in, k_h)
     init_hiddens = [cgt.matrix() for _ in xrange(get_num_hiddens(arch, n_layers))]
     # TODO fixed sizes
 
@@ -284,10 +313,12 @@ def main():
     parser.add_argument("--size_batch", type=int,default=64)
     parser.add_argument("--n_layers",type=int,default=2)
     parser.add_argument("--n_unroll",type=int,default=16)
+    parser.add_argument("--k_in",type=int,default=3)
+    parser.add_argument("--k_h",type=int,default=5)
     parser.add_argument("--step_size",type=float,default=.01)
     parser.add_argument("--decay_rate",type=float,default=0.95)
     parser.add_argument("--n_epochs",type=int,default=20)
-    parser.add_argument("--arch",choices=["lstm","gru"],default="lstm")
+    parser.add_argument("--arch",choices=["lstm","gru"],default="gru")
     parser.add_argument("--grad_check",action="store_true")
     parser.add_argument("--profile",action="store_true")
     parser.add_argument("--unittest",action="store_true")
@@ -301,18 +332,19 @@ def main():
     loader = Loader(args.data_dir,args.size_batch, args.n_unroll, (.8,.1,.1))
 
     network, f_loss, f_loss_and_grad, f_step = make_loss_and_grad_and_step(args.arch, loader.size_vocab, 
-        loader.size_vocab, args.size_mem, args.size_batch, args.n_layers, args.n_unroll)
+        loader.size_vocab, args.size_mem, args.size_batch, args.n_layers, args.n_unroll, args.k_in, args.k_h)
 
     if args.profile: profiler.start()
 
     params = network.get_parameters()
     pc = ParamCollection(params)
-    pc.set_value_flat(nr.uniform(-.1, .1, size=(pc.get_total_size(),)))
+    pc.set_value_flat(nr.uniform(-1, 1, size=(pc.get_total_size(),)))
 
     def initialize_hiddens(n):
-        return [np.zeros((n, args.size_mem), cgt.floatX) for _ in xrange(get_num_hiddens(args.arch, args.n_layers))]
+        return [np.ones((n, args.size_mem), cgt.floatX) / float(args.size_mem) for _ in xrange(get_num_hiddens(args.arch, args.n_layers))]
 
     if args.grad_check:
+    #if True:
         x,y = loader.train_batches_iter().next()
         prev_hiddens = initialize_hiddens(args.size_batch)
         def f(thnew):
@@ -322,9 +354,16 @@ def main():
             pc.set_value_flat(thold)
             return loss
         from cgt.numeric_diff import numeric_grad
+        print "Beginning grad check"
         g_num = numeric_grad(f, pc.get_value_flat(),eps=1e-10)
+        print "Ending grad check"
         result = f_loss_and_grad(x,y,*prev_hiddens)
         g_anal = result[1]
+        diff = g_num - g_anal
+        abs_diff = np.abs(diff)
+        print np.where(abs_diff > 1e-4)
+        print diff[np.where(abs_diff > 1e-4)]
+        embed()
         assert np.allclose(g_num, g_anal, atol=1e-4)
         print "Gradient check succeeded!"
         return

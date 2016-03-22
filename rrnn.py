@@ -13,6 +13,7 @@ from time import time
 from StringIO import StringIO
 from param_collection import ParamCollection
 from IPython import embed
+from numpy.linalg import norm
 
 # via https://github.com/karpathy/char-rnn/blob/master/model/GRU.lua
 # via http://arxiv.org/pdf/1412.3555v1.pdf
@@ -72,6 +73,56 @@ def make_deep_lstm(size_input, size_mem, n_layers, size_output, size_batch):
 
     return nn.Module(inputs, outputs)
 
+def make_deep_rrnn_rot_relu(size_input, size_mem, n_layers, size_output, size_batch_in, k_in, k_h):
+    inputs = [cgt.matrix() for i_layer in xrange(n_layers+1)]
+    outputs = []
+    print 'input_size: ', size_input
+    for i_layer in xrange(n_layers):
+        prev_h = inputs[i_layer+1] # note that inputs[0] is the external input, so we add 1
+        x = inputs[0] if i_layer==0 else outputs[i_layer-1]
+        size_x = size_input if i_layer==0 else size_mem
+        size_batch = prev_h.shape[0]
+
+        xform_h_param = nn.TensorParam((2 * k_h, size_mem), name="rotxform")
+        xform_h_non = xform_h_param.weight
+        xform_h_non.props["is_rotation"] = True
+
+        xform_h_norm = cgt.norm(xform_h_non, axis=1, keepdims=True)
+        xform_h = cgt.broadcast('/', xform_h_non, xform_h_norm, "xx,x1")
+
+        add_in_lin = nn.Affine(size_x, size_mem)(x)
+        add_in_relu = nn.rectify(add_in_lin)
+
+        prev_h_scaled = nn.scale_mag(prev_h)
+
+
+        h_in_added = prev_h_scaled + add_in_relu
+        inters_h = [h_in_added]
+
+        colon = slice(None, None, None)
+
+        for i in xrange(2 * k_h):
+            inter_in = inters_h[-1]
+            r_cur = xform_h[i, :]
+            #r_cur = cgt.subtensor(xform_h, [i, colon])
+            r_cur_2_transpose = cgt.reshape(r_cur, (size_mem, 1))
+            r_cur_2 = cgt.reshape(r_cur, (1, size_mem))
+            ref_cur = cgt.dot(cgt.dot(inter_in, r_cur_2_transpose), r_cur_2)
+            inter_out = inter_in - 2 * ref_cur
+            inters_h.append(inter_out)
+        next_h = inters_h[-1]
+        outputs.append(next_h)
+
+
+    category_activations = nn.Affine(size_mem, size_output,name="pred")(outputs[-1])
+    logprobs = nn.logsoftmax(category_activations)
+    outputs.append(logprobs)
+
+    #print 'len outputs:', len(outputs)
+    #print 'len inputs:', len(inputs)
+
+    return nn.Module(inputs, outputs)
+
 def make_deep_rrnn(size_input, size_mem, n_layers, size_output, size_batch_in, k_in, k_h):
     inputs = [cgt.matrix() for i_layer in xrange(n_layers+1)]
     outputs = []
@@ -84,6 +135,7 @@ def make_deep_rrnn(size_input, size_mem, n_layers, size_output, size_batch_in, k
 
         xform_h_param = nn.TensorParam((2 * k_h, size_mem), name="rotxform")
         xform_h_non = xform_h_param.weight
+        xform_h_non.props["is_rotation"] = True
         xform_h_norm = cgt.norm(xform_h_non, axis=1, keepdims=True)
         xform_h = cgt.broadcast('/', xform_h_non, xform_h_norm, "xx,x1")
 
@@ -169,7 +221,7 @@ def make_loss_and_grad_and_step(arch, size_input, size_output, size_mem, size_ba
     x_tnk = cgt.tensor3()
     targ_tnk = cgt.tensor3()
     #make_network = make_deep_lstm if arch=="lstm" else make_deep_gru
-    make_network = make_deep_rrnn
+    make_network = make_deep_rrnn_rot_relu
     network = make_network(size_input, size_mem, n_layers, size_output, size_batch, k_in, k_h)
     init_hiddens = [cgt.matrix() for _ in xrange(get_num_hiddens(arch, n_layers))]
     # TODO fixed sizes
@@ -338,7 +390,30 @@ def main():
 
     params = network.get_parameters()
     pc = ParamCollection(params)
-    pc.set_value_flat(nr.uniform(-1, 1, size=(pc.get_total_size(),)))
+    pc.set_value_flat(nr.uniform(-0.01, 0.01, size=(pc.get_total_size(),)))
+
+    for i, param in enumerate(pc.params):
+        if "is_rotation" in param.props:
+            shape = pc.get_shapes()[i]
+            num_vec = int(shape[0] / 2)
+            size_vec = int(shape[1])
+            gauss = nr.normal(size=(num_vec * size_vec))
+            gauss = np.reshape(gauss, (num_vec, size_vec))
+            gauss_mag = norm(gauss, axis=1, keepdims=True)
+            gauss_normed = gauss / gauss_mag
+            gauss_perturb = nr.normal(scale=0.01, size=(num_vec * size_vec))
+            gauss_perturb = np.reshape(gauss_perturb, (num_vec, size_vec))
+            second_vec = gauss_normed + gauss_perturb
+            second_vec_mag = norm(second_vec, axis=1, keepdims=True)
+            second_vec_normed = second_vec / second_vec_mag
+            new_param_value = np.zeros(shape)
+            for j in xrange(num_vec):
+                new_param_value[2 * j, :] = gauss_normed[j, :]
+                new_param_value[2 * j + 1, :] = second_vec_normed[j, :]
+            param.op.set_value(new_param_value)
+            #print new_param_value
+
+
 
     def initialize_hiddens(n):
         return [np.ones((n, args.size_mem), cgt.floatX) / float(args.size_mem) for _ in xrange(get_num_hiddens(args.arch, args.n_layers))]
